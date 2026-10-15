@@ -1459,3 +1459,146 @@ fn closure_with_own_loop_labeled_break_emits() {
     assert!(go.contains("break hyLoop"), ":\n{}", go);
 
 }
+// #158 — expression-form `?` inside a short-circuiting `&&` / `||`
+//
+// Before this fix the operand's call was hoisted ABOVE the operator, so
+// `false && touched()?` ran `touched()` (side effects fired, and an error
+// result terminated a program that should never have called it). On the
+// real corpus the emitted wrapper for the issue's reproduction was
+//
+//     hyT0, hyErr1 := touched()
+//     if hyErr1 != nil { hyErr = hyErr1; return }
+//     result := false && hyT0
+//
+// — the operand ran regardless. The fix keeps the call INSIDE the guard the
+// operator implies, using statements, so the `?` propagation (`return`) and
+// `break`/`continue`/`defer` in the operand keep their meaning.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn short_circuit_try_keeps_the_operand_inside_the_guard() {
+    let go = emit(
+        "fn touched() (bool, error) {\n\
+           return true, nil\n\
+         }\n\
+         fn main() {\n\
+           result := false && touched()?\n\
+           fmt.println(result)\n\
+         }",
+    );
+    // `&&` needs the operand evaluated only when the left side is TRUE.
+    assert!(
+        go.contains("if hySc"),
+        "the operand must be guarded by a plain `if` \n{}",
+        go
+    );
+    assert!(
+        !go.contains("if !hySc"),
+        "`&&` must NOT negate the guard\n{}",
+        go
+    );
+    // the CALL (its temp binding) sits INSIDE the guard, and nowhere before
+    // it — `touched()` alone would also match the definition above `main`.
+    let guard = go.find("if hySc").expect("guard");
+    let main_at = go.find("func main()").expect("main");
+    assert!(
+        !go[main_at..guard].contains("hyT"),
+        "no hoisted operand temp may precede the guard\n{}",
+        go
+    );
+    assert!(
+        go[guard..].contains("hyT"),
+        "the operand's call (temp binding) must be inside the guard\n{}",
+        go
+    );
+    // the binary expression substitutes to the temp
+    assert!(
+        go.contains("result := hySc"),
+        "the binary expression substitutes to its boolean temp\n{}",
+        go
+    );
+    assert!(
+        !go.contains("&& hyT") && !go.contains("false && touched"),
+        "the old eager shape must be gone\n{}",
+        go
+    );
+}
+
+#[test]
+fn short_circuit_try_or_negates_the_guard() {
+    let go = emit(
+        "fn touched() (bool, error) {\n\
+           return false, nil\n\
+         }\n\
+         fn main() {\n\
+           result := true || touched()?\n\
+           fmt.println(result)\n\
+         }",
+    );
+    // `||` evaluates the operand only when the left side is FALSE.
+    assert!(
+        go.contains("if !hySc"),
+        "`||` must negate the guard so the operand runs only when false\n{}",
+        go
+    );
+    let guard = go.find("if !hySc").expect("guard");
+    let main_at = go.find("func main()").expect("main");
+    assert!(
+        !go[main_at..guard].contains("hyT"),
+        "no hoisted operand temp may precede the guard\n{}",
+        go
+    );
+    assert!(
+        go[guard..].contains("hyT"),
+        "the operand's call (temp binding) must be inside the guard\n{}",
+        go
+    );
+    assert!(go.contains("result := hySc"), "substitutes to the temp\n{}", go);
+}
+
+#[test]
+fn short_circuit_without_try_keeps_the_plain_expression() {
+    // No `?` in the operand: nothing changes — the operator stays an
+    // expression (Go short-circuits it natively, and no statement wrapper is
+    // introduced that could alter `break`/`continue`/`defer`).
+    let go = emit(
+        "fn touched() bool {\n\
+           return true\n\
+         }\n\
+         fn main() {\n\
+           result := false && touched()\n\
+           fmt.println(result)\n\
+         }",
+    );
+    assert!(
+        go.contains("false && touched()"),
+        "the plain binary expression must survive untouched\n{}",
+        go
+    );
+    assert!(!go.contains("hySc"), "no short-circuit temp without a `?`\n{}", go);
+}
+
+#[test]
+fn short_circuit_left_operand_try_is_unaffected() {
+    // A `?` on the LEFT operand is evaluated first either way — hoisting it
+    // is correct and must keep working (only the right operand is skipped).
+    let go = emit(
+        "fn check(n int) (bool, error) {\n\
+           return n > 0, nil\n\
+         }\n\
+         fn main() {\n\
+           result := check(5)? && false\n\
+           fmt.println(result)\n\
+         }",
+    );
+    assert!(
+        go.contains("check(5)"),
+        "the left operand's call is emitted\n{}",
+        go
+    );
+    assert!(
+        go.contains("hyErr"),
+        "its error propagation is emitted\n{}",
+        go
+    );
+}

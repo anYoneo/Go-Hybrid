@@ -330,10 +330,54 @@ impl Emitter {
                 self.hoist_tries_expr(operand)?;
                 self.hoist_one_try(operand, (span.start.line, span.start.col))?;
             }
-            Expr::Binary { lhs, rhs, .. } => {
+            Expr::Binary {
+                op, lhs, rhs, span, ..
+            } => {
                 self.hoist_tries_expr(lhs)?;
-                self.hoist_tries_expr(rhs)?;
+                if self.short_circuited_try(rhs, op) {
+                    // SHORT-CIRCUIT (issue #158). `a && b?` must NOT evaluate
+                    // b when a is false — but hoisting b's call above the
+                    // operator does exactly that (observed on main @ f99d6d0:
+                    // `false && touched()?` printed the operand's side effect,
+                    // and an error result terminated a program that should
+                    // never have called it).
+                    //
+                    // The fix keeps the operand inside the guard the operator
+                    // itself implies, using statements (the `?` propagation is
+                    // a `return`, and `break`/`continue`/`defer` inside the
+                    // operand keep referring to the same function):
+                    //
+                    //     hySc0 := a
+                    //     if hySc0 {              // `if !hySc0` for `||`
+                    //         hyT1, hyErr2 := b()
+                    //         if hyErr2 != nil { ...; return }
+                    //         hySc0 = hyT1
+                    //     }
+                    //
+                    // The whole binary expression then substitutes to `hySc0`.
+                    let (tmp, lhs, rhs, is_and, span) = (
+                        self.next_temp("hySc"),
+                        lhs.clone(),
+                        rhs.clone(),
+                        matches!(op, BinOp::And),
+                        *span,
+                    );
+                    let ltext = self.emit_expr(lhs.as_ref(), 0)?;
+                    self.push(&format!("{} := {}", tmp, ltext));
+                    self.push(&format!("if {}{} {{", if is_and { "" } else { "!" }, tmp));
+                    self.indent += 1;
+                    self.hoist_tries_expr(rhs.as_ref())?;
+                    let rtext = self.emit_expr(rhs.as_ref(), 0)?;
+                    self.push(&format!("{} = {}", tmp, rtext));
+                    self.indent -= 1;
+                    self.push("}");
+                    self.bin_temps
+                        .insert((span.start.line, span.start.col), tmp);
+                } else {
+                    self.hoist_tries_expr(rhs)?;
+                }
             }
+
             Expr::Unary { operand, .. }
             | Expr::AddrOf { operand, .. }
             | Expr::Move { operand, .. }
@@ -437,6 +481,102 @@ impl Emitter {
     /// Known from four sources (Batch I): rust-crate descriptors, typed
     /// binding methods, user-fn declarations, and the default rust-call
     /// convention (1, true). None = unknown → callers keep today's shape.
+    /// True when `e` (the RIGHT operand of `op`) contains a `?` whose call
+    /// can return an error, and `op` is a short-circuiting operator — the
+    /// shape issue #158 describes. The call must resolve, so the refusal is
+    /// only ever issued against a CERTAIN error-returning call: an
+    /// unresolvable callee keeps the previous (hoisting) behaviour rather
+    /// than inventing a new refusal.
+    fn short_circuited_try(&self, e: &Expr, op: &BinOp) -> bool {
+        if !matches!(op, BinOp::And | BinOp::Or) {
+            return false;
+        }
+        let mut found = false;
+        self.walk_tries(e, &mut found);
+        found
+    }
+
+    fn walk_tries(&self, e: &Expr, found: &mut bool) {
+        match e {
+            Expr::Try { operand, .. } => {
+                if matches!(self.call_results(operand), Some((_, true))) {
+                    *found = true;
+                }
+                self.walk_tries(operand, found);
+            }
+            Expr::Binary { lhs, rhs, .. } => {
+                self.walk_tries(lhs, found);
+                self.walk_tries(rhs, found);
+            }
+            Expr::Unary { operand, .. }
+            | Expr::AddrOf { operand, .. }
+            | Expr::Move { operand, .. }
+            | Expr::Paren { inner: operand, .. } => self.walk_tries(operand, found),
+            Expr::Interp { parts, .. } => {
+                for p in parts {
+                    if let InterpPart::Expr(x) = p {
+                        self.walk_tries(x, found);
+                    }
+                }
+            }
+            Expr::Call { callee, args, .. } => {
+                self.walk_tries(callee, found);
+                for a in args {
+                    self.walk_tries(&a.value, found);
+                }
+            }
+            Expr::Receive { chan, .. } => self.walk_tries(chan, found),
+            Expr::Field { base, .. } => self.walk_tries(base, found),
+            Expr::Index { base, index, .. } => {
+                self.walk_tries(base, found);
+                self.walk_tries(index, found);
+            }
+            Expr::Slice { base, lo, hi, .. } => {
+                self.walk_tries(base, found);
+                if let Some(l) = lo {
+                    self.walk_tries(l, found);
+                }
+                if let Some(h) = hi {
+                    self.walk_tries(h, found);
+                }
+            }
+            Expr::StructLit { fields, .. } => {
+                for f in fields {
+                    self.walk_tries(&f.value, found);
+                }
+            }
+            Expr::SliceLit { items, .. } => {
+                for i in items {
+                    self.walk_tries(i, found);
+                }
+            }
+            Expr::MapLit { entries, .. } => {
+                for (k, v) in entries {
+                    self.walk_tries(k, found);
+                    self.walk_tries(v, found);
+                }
+            }
+            // A closure body hoists its own tries — never ours.
+            Expr::FnLit { .. } | Expr::Lit { .. } | Expr::Ident { .. } => {}
+        }
+    }
+
+    /// The honest refusal for issue #158.
+    fn refuse_shortcircuit_try(&self, rhs: &Expr, op: BinOp) -> Result<(), EmitError> {
+        Err(EmitError::unsupported(format!(
+            "`?` on the right operand of `{}` cannot be lowered without breaking short-circuit \
+             evaluation (issue #158): the `?` propagation is a `return`, so hoisting \
+             `{}` above the operator would run it even when `{}` should skip it — \
+             observable side effects, and an error result terminating a program that \
+             never called the operand. Restructure so the fallible call happens first \
+             and only the resulting boolean is combined: \
+             `b, err := call()?` then `result := a && b`",
+            rhs.render(),
+            rhs.render(),
+            if matches!(op, BinOp::And) { "&&" } else { "||" },
+        )))
+    }
+
     fn call_results(&self, e: &Expr) -> Option<(usize, bool)> {
         let callee = match e {
             Expr::Try { operand, .. } => match operand.as_ref() {

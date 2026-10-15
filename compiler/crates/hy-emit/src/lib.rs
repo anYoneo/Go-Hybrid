@@ -373,6 +373,11 @@ pub struct Emitter {
     /// E3 expression-form hoists (Batch G): Try span start → the hoisted
     /// temp. emit_expr's Try branch substitutes the temp; cleared per fn.
     try_temps: BTreeMap<(u32, u32), String>,
+    /// STATEMENT-form short-circuit lowering (issue #158): a `&&` / `||`
+    /// whose right operand contains a hoistable `?` substitutes to ONE
+    /// boolean temp instead of an expression. Keyed by the Binary's span
+    /// start — `Expr::Binary` looks here before emitting the operator.
+    bin_temps: BTreeMap<(u32, u32), String>,
     /// Package mode (example 09): the emitted `package` clause, the prefix
     /// binding-package imports use, and whether `pub fn` exports.
     package_name: String,
@@ -421,6 +426,7 @@ impl Emitter {
             pending_fnlit_conv: None,
             cur_fn_conv_result: None,
             try_temps: BTreeMap::new(),
+            bin_temps: BTreeMap::new(),
             package_name: "main".to_string(),
             binding_prefix: "hybrid.program".to_string(),
             export_pub: false,
@@ -430,6 +436,12 @@ impl Emitter {
             var_struct: BTreeMap::new(),
             var_ty: BTreeMap::new(),
         }
+    }
+
+    /// The boolean temp a STATEMENT-form short-circuit lowering produced for
+    /// this binary expression, if any (issue #158).
+    pub(crate) fn bin_temps_get(&self, line: u32, col: u32) -> Option<String> {
+        self.bin_temps.get(&(line, col)).cloned()
     }
 
     fn next_temp(&mut self, stem: &str) -> String {
@@ -689,6 +701,7 @@ impl Emitter {
         self.try_temps.clear();
         self.loop_labels.clear();
         self.loop_label_n = 0;
+        self.bin_temps.clear();
 
         // Associated functions (`lru_cache.new`) mangle to
         // `lru_cache_new` — Go has no dotted identifiers. Call sites mangle

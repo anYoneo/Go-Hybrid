@@ -109,6 +109,18 @@ impl Emitter {
 
             Expr::Interp { parts, .. } => self.emit_interp(parts),
 
+            // A binary expression the short-circuit lowering (issue #158)
+            // already emitted as statements substitutes to its boolean temp.
+            Expr::Binary { span, .. }
+                if self
+                    .bin_temps_get(span.start.line, span.start.col)
+                    .is_some() =>
+            {
+                Ok(self
+                    .bin_temps_get(span.start.line, span.start.col)
+                    .unwrap())
+            }
+
             Expr::Binary { op, lhs, rhs, .. } => {
                 let p = bin_prec(*op);
                 let l = self.emit_expr(lhs, p)?;
