@@ -374,6 +374,10 @@ impl FnState {
 // ---------------------------------------------------------------------------
 
 pub(crate) struct Checker<'a> {
+    /// Test-only: suppress the element-type diagnostic so sendability can be
+    /// exercised at the same site (the real checker never sets this).
+    pub(crate) suppress_type_mismatch: bool,
+
     pub file: &'a File,
     /// Source path, cloned onto every diagnostic.
     pub path: String,
@@ -421,6 +425,7 @@ impl<'a> Checker<'a> {
             sites_via_managed: 0,
             total_sites: 0,
             managed_audit: Vec::new(),
+            suppress_type_mismatch: false,
         }
     }
 

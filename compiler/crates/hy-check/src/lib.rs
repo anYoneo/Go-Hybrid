@@ -2601,5 +2601,104 @@ mod tests {
         // the diagnosis for the owned-binding variant of this shape.
         assert_eq!(r.diagnostics[0].code, "HYB-E3004");
     }
-}
 
+    // -----------------------------------------------------------------------
+    // #146 — the channel ELEMENT TYPE was never checked. `ch <- v` into a
+    // `chan job` passed with 0 diagnostics and then died in `go build`
+    // ("cannot use 7 ... as job value in send"), breaking the contract that
+    // every accepted program emits buildable Go (BOUNTY.md: "an accepted-but-
+    // unsound program is a P0 by definition"). The DIRECTION check (E3007)
+    // covers the target; this closes the element.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn send_element_type_mismatch_rejects_e3008() {
+        let r = check(
+            "struct job { cost int }\n\
+             fn main() {\n\
+               ch := make(chan job, 1)\n\
+               ch <- 7\n\
+             }",
+        );
+        assert_eq!(r.verdict, Verdict::Reject, "{:?}", r.diagnostics);
+        assert_eq!(r.diagnostics[0].code, "HYB-E3008");
+        // the message names the declared element type, not a generic phrase
+        assert!(r.diagnostics[0].message.contains("job"), "{}", r.diagnostics[0].message);
+    }
+
+    #[test]
+    fn send_element_type_mismatch_string_into_int_channel_rejects() {
+        let r = check(
+            "fn main() {\n\
+               ch := make(chan int, 1)\n\
+               ch <- \"hello\"\n\
+             }",
+        );
+        assert_eq!(r.verdict, Verdict::Reject, "{:?}", r.diagnostics);
+        assert_eq!(r.diagnostics[0].code, "HYB-E3008");
+    }
+
+    #[test]
+    fn send_element_type_match_accepts() {
+        // the shape classes match exactly — no diagnosis, and the program the
+        // checker accepts still emits buildable Go
+        let r = check(
+            "fn main() {\n\
+               ch := make(chan int, 1)\n\
+               ch <- 7\n\
+               v := <-ch\n\
+               fmt.println(v)\n\
+             }",
+        );
+        assert_eq!(r.verdict, Verdict::Accept, "{:?}", r.diagnostics);
+    }
+
+    #[test]
+    fn send_element_type_string_channel_accepts() {
+        let r = check(
+            "fn main() {\n\
+               ch := make(chan string, 1)\n\
+               ch <- \"hello\"\n\
+               fmt.println(<-ch)\n\
+             }",
+        );
+        assert_eq!(r.verdict, Verdict::Accept, "{:?}", r.diagnostics);
+    }
+
+    #[test]
+    fn send_element_type_unnamed_struct_stays_permissive() {
+        // A shape this pass cannot pin down must NOT be rejected: a false
+        // reject would be far worse than a missed one. A permissive pass
+        // still fails closed where it cannot prove anything (E3005).
+        let r = check(
+            "fn unknown() int { 1 }\n\
+             fn main() {\n\
+               ch := make(chan int, 1)\n\
+               x := unknown()\n\
+               ch <- x\n\
+             }",
+        );
+        assert!(
+            !r.diagnostics.iter().any(|d| d.code == "HYB-E3008"),
+            "{:?}",
+            r.diagnostics
+        );
+    }
+
+    #[test]
+    fn send_element_type_does_not_shadow_sendability_reject() {
+        // A value already rejected as non-sendable keeps its own, more severe
+        // diagnostic — no cascade (this is exactly the `jobs <- p` case where
+        // p is `*int`: E3002, never E3008).
+        let r = check(
+            "fn main() {\n\
+               jobs := make(chan int, 1)\n\
+               p := new(int)\n\
+               jobs <- p\n\
+             }",
+        );
+        assert_eq!(r.verdict, Verdict::Reject, "{:?}", r.diagnostics);
+        assert_eq!(r.diagnostics[0].code, "HYB-E3002");
+        assert!(!r.diagnostics.iter().any(|d| d.code == "HYB-E3008"));
+    }
+}

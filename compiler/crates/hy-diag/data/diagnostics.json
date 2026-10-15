@@ -224,6 +224,21 @@
       "tier0_rule_id": "A1c"
     },
     {
+      "code": "HYB-E3008",
+      "name": "send-element-type-mismatch",
+      "category": "ownership-sendability",
+      "severity": "error",
+      "title": "value does not match the channel's element type",
+      "summary": "`ch <- v` where the channel was declared with an element type and `v` has a CERTAIN, incompatible shape class (primitive vs string vs struct vs chan vs map vs slice...) is rejected: the accepted-subset contract is that every accepted program emits buildable Go, and this one died in `go build` with `cannot use ... as ... value in send` (issue #146). The channel DIRECTION is checked elsewhere (HYB-E3007 and friends); this rule covers the ELEMENT TYPE. Only certain mismatches are reported — an unresolved shape, an opaque/foreign shape, or an unnamed struct stays permissive, because a false reject is worse than a missed one.",
+      "fixits": [
+        "send a value of the declared element type: declare the channel as `chan int` when sending `7`, or send a `job` value into a `chan job`",
+        "when the sent value is a struct literal or a resolved binding, the members are checked separately (HYB-E5004 covers struct-literal fields)"
+      ],
+      "example": "struct job { cost int }\nch := make(chan job, 1)\nch <- 7   // reject: HYB-E3008 — `7` is not a `job`",
+      "rule": "O4",
+      "tier0_rule_id": "A1c"
+    },
+    {
       "code": "HYB-E3010",
       "name": "loop-label-out-of-scope",
       "category": "resolve",

@@ -510,6 +510,36 @@ impl<'a> Checker<'a> {
 
     /// The element shape of a channel expression, when it resolves (drives
     /// the N1 nil checks on sent values).
+    /// Could a value of shape `v` legitimately be the element `want` of a
+    /// channel? This pass compares COARSE shape classes only (primitive vs
+    /// string vs struct vs chan vs map vs slice...), which is exactly the
+    /// resolution `TypeShape` has. `Unknown` never reaches here (the caller
+    /// skips it) and every case this cannot distinguish is treated as
+    /// compatible, so a false reject stays impossible.
+    fn shape_may_be_elem(v: &TypeShape, want: &TypeShape) -> bool {
+        use TypeShape::*;
+        match (v, want) {
+            // unknown / opaque shapes carry no opinion — stay permissive
+            (Unknown, _) | (_, Unknown) => true,
+            (Struct(None), _) | (_, Struct(None)) => true,
+            (ForeignOpaque(_), _) | (_, ForeignOpaque(_)) => true,
+            (Primitive, Primitive) | (Str, Str) | (Atomic, Atomic) => true,
+            (Struct(Some(a)), Struct(Some(b))) => a == b,
+            (Map(_, _), Map(_, _)) => true,
+            (Slice(_), Slice(_)) | (Array(_), Array(_)) => true,
+            // a slice/array pair is convertible in Go for the element type
+            (Slice(_), Array(_)) | (Array(_), Slice(_)) => true,
+            (Pointer(_), Pointer(_)) => true,
+            (Chan(a), Chan(b)) => Self::shape_may_be_elem(a, b),
+            (Closure, Closure) => true,
+            (OwnHandle(a), OwnHandle(b)) => a == b,
+            (BorrowHandle(a), BorrowHandle(b)) => a == b,
+            // primitives, strings, composites and handles are distinct value
+            // kinds: sending one where another was declared is a certain error
+            _ => false,
+        }
+    }
+
     pub(crate) fn chan_elem_shape(&self, st: &FnState, chan: &Expr) -> Option<Vec<TypeShape>> {
         match self.shape_of_expr(st, chan) {
             TypeShape::Chan(e) => Some(vec![*e]),
@@ -517,7 +547,18 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// Classify a send's TARGET (#77): a send is only well-typed when the
+    /// A human name for a shape, for diagnostics — honours a known struct name
+/// so the message can say `job` rather than just "struct".
+pub(crate) fn elem_noun(t: &TypeShape) -> String {
+    match t {
+        TypeShape::Struct(Some(name)) => format!("`{name}`"),
+        TypeShape::ForeignOpaque(name) => format!("`{name}`"),
+        TypeShape::OwnHandle(name) | TypeShape::BorrowHandle(name) => format!("`{name}`"),
+        other => other.noun().to_string(),
+    }
+}
+
+/// Classify a send's TARGET (#77): a send is only well-typed when the
     /// channel expression resolves to a channel shape. Before this check a
     /// deliberate `noop() <- 1` (void call as target) and the accidental
     /// newline fusion `noop()` / `<-done` (parser) both passed with 0
@@ -805,6 +846,26 @@ impl<'a> Checker<'a> {
                 continue;
             }
 
+            // The declared element type of the send target (issue #146). The
+            // direction is enforced elsewhere; the ELEMENT TYPE was not, so
+            // `ch <- 7` into a `chan job` passed check and then died in
+            // `go build` ("cannot use 7 ... as job value in send").
+            let target = target_shapes.and_then(|ts| ts.get(vi)).cloned();
+            // A mismatch is only reported when the value's shape is CERTAIN.
+            // A wrong reject would be far worse than a missed one.
+            let value_shape = self.shape_of_expr(st, v);
+            let mut type_mismatch: Option<String> = None;
+            if let Some(t) = &target {
+                if value_shape != TypeShape::Unknown
+                    && !Self::shape_may_be_elem(&value_shape, t)
+                {
+                    type_mismatch = Some(format!(
+                        "the declared element type is {}",
+                        Self::elem_noun(t)
+                    ));
+                }
+            }
+
             let mut v_moves = Vec::new();
             crate::model::collect_move_operands(v, &mut v_moves);
             for (op, mspan) in v_moves {
@@ -826,7 +887,36 @@ impl<'a> Checker<'a> {
             }
 
             match self.classify_value(st, v) {
-                Outcome::Ok => {}
+                Outcome::Ok => {
+                    // The value IS within the sendability contract, so the only
+                    // thing left to check is whether it matches the declared
+                    // element type (issue #146). Reported here — and only here —
+                    // so a value that is ALREADY rejected as non-sendable keeps
+                    // its single, more severe diagnostic (no cascade), and a
+                    // certain type error never hides behind a sendability note.
+                    if let Some(declared) = &type_mismatch {
+                        if !self.suppress_type_mismatch {
+                            self.diags.push(
+                                Diagnostic::error(
+                                    "HYB-E3008",
+                                    self.path.clone(),
+                                    v.span(),
+                                    format!(
+                                        "`{}` cannot be the element sent here — {} (HYB-E3008)",
+                                        v.render(),
+                                        declared
+                                    ),
+                                )
+                                .with_notes(vec![
+                                    "the emitted Go cannot build: `cannot use ... as ... value in send`"
+                                        .to_string(),
+                                    "the channel's DIRECTION is checked elsewhere; this is the ELEMENT TYPE"
+                                        .to_string(),
+                                ]),
+                            );
+                        }
+                    }
+                }
                 Outcome::Managed { desc, risky } => {
                     // only values not safe-by-type are the trust surface
                     if risky {
