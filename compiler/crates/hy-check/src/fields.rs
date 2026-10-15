@@ -31,7 +31,7 @@
 //! (`pkg.thing{...}`) and type-elided (`{x: 1}`) literals are skipped, and a
 //! **partial** field set is silent — Go allows naming a subset.
 
-use hy_syntax::{FieldInit, TypeExpr};
+use hy_syntax::{Expr, FieldInit, LitKind, TypeExpr};
 
 /// Why a struct literal does not match its declared struct.
 pub enum FieldError {
@@ -89,6 +89,114 @@ pub fn render_field_names(declared: &[(String, TypeExpr)]) -> String {
         .map(|(n, _)| n.as_str())
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// Why a struct-literal field VALUE cannot be the declared type.
+pub enum ValueError {
+    /// A literal of a family the declared field type can never hold.
+    Mismatch {
+        field: String,
+        declared: String,
+        given: &'static str,
+    },
+}
+
+/// The primitive families this pass understands well enough to be certain.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Family {
+    Int,
+    Float,
+    Str,
+    Bool,
+}
+
+fn primitive_family(name: &str) -> Option<Family> {
+    match name {
+        "int" | "int8" | "int16" | "int32" | "int64" | "uint" | "uint8" | "uint16" | "uint32"
+        | "uint64" | "u8" | "u16" | "u32" | "u64" | "i8" | "i16" | "i32" | "i64" => {
+            Some(Family::Int)
+        }
+        "float32" | "float64" | "f32" | "f64" => Some(Family::Float),
+        "string" => Some(Family::Str),
+        "bool" => Some(Family::Bool),
+        _ => None,
+    }
+}
+
+/// What a value literal certainly IS, at the granularity this pass needs.
+/// Anything that is not a literal (an identifier, a call) returns `None`:
+/// its type is not knowable here, so it is never reported.
+fn literal_class(v: &Expr) -> Option<(Family, &'static str)> {
+    match v {
+        Expr::Lit {
+            kind: LitKind::Int(_),
+            ..
+        } => Some((Family::Int, "an integer literal")),
+        Expr::Lit {
+            kind: LitKind::Float(_),
+            ..
+        } => Some((Family::Float, "a float literal")),
+        Expr::Lit {
+            kind: LitKind::Str(_) | LitKind::RawStr(_),
+            ..
+        } => Some((Family::Str, "a string literal")),
+        Expr::Lit {
+            kind: LitKind::Bool(_),
+            ..
+        } => Some((Family::Bool, "a bool literal")),
+        // An interpolated string is a Go string; its type is never in doubt.
+        Expr::Interp { .. } => Some((Family::Str, "an interpolated string")),
+        _ => None,
+    }
+}
+
+/// Can a literal of family `given` ever be the declared family?
+/// An integer literal is fine for a float field (Go converts the constant);
+/// nothing else crosses.
+fn compatible(declared: Family, given: Family) -> bool {
+    match declared {
+        Family::Int => given == Family::Int,
+        Family::Float => given == Family::Int || given == Family::Float,
+        Family::Str => given == Family::Str,
+        Family::Bool => given == Family::Bool,
+    }
+}
+
+/// Check struct-literal field VALUES against the declared field types.
+///
+/// Only certain, local mismatches are reported: the field must be declared,
+/// its declared type must be a built-in primitive this pass knows, and the
+/// value must be a literal (or an interpolated string). Everything else —
+/// identifiers, calls, user types, slices, maps, `any` — is silent.
+pub fn check_field_value_literals(
+    declared: &[(String, TypeExpr)],
+    fields: &[FieldInit],
+) -> Option<ValueError> {
+    if declared.is_empty() {
+        return None;
+    }
+    for f in fields {
+        let Some((_, ty)) = declared.iter().find(|(n, _)| n == &f.name) else {
+            continue; // an unknown field name is E5004's business, not this pass
+        };
+        let TypeExpr::Named { name, .. } = ty else {
+            continue;
+        };
+        let Some(want) = primitive_family(name) else {
+            continue;
+        };
+        let Some((got, desc)) = literal_class(&f.value) else {
+            continue;
+        };
+        if !compatible(want, got) {
+            return Some(ValueError::Mismatch {
+                field: f.name.clone(),
+                declared: name.clone(),
+                given: desc,
+            });
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -176,5 +284,102 @@ mod tests {
             check_struct_lit_fields(&[], &f).is_none(),
             "an unregistered struct stays permissive"
         );
+    }
+
+    // ---------------- issue #152, slice 3: struct-literal field VALUES ---------
+
+    fn lit_of(src: &str) -> Vec<FieldInit> {
+        let (_, f) = lit_fields(src);
+        f
+    }
+
+    #[test]
+    fn string_literal_in_int_field_is_reported() {
+        let d = struct_fields(TITIK);
+        let f = lit_of("struct titik {\n    x int\n    y int\n}\nfn main() { p := titik{x: \"bukan\"} }");
+        match check_field_value_literals(&d, &f) {
+            Some(ValueError::Mismatch { field, declared, .. }) => {
+                assert_eq!(field, "x");
+                assert_eq!(declared, "int");
+            }
+            _ => panic!("expected Mismatch"),
+        }
+    }
+
+    #[test]
+    fn int_literal_in_string_field_is_reported() {
+        let src = "struct s { nama string }\nfn main() { p := s{nama: 7} }";
+        let d = struct_fields(src);
+        let f = lit_of(src);
+        assert!(matches!(
+            check_field_value_literals(&d, &f),
+            Some(ValueError::Mismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn bool_literal_in_int_field_is_reported() {
+        let src = "struct s { n int }\nfn main() { p := s{n: true} }";
+        let d = struct_fields(src);
+        let f = lit_of(src);
+        assert!(matches!(
+            check_field_value_literals(&d, &f),
+            Some(ValueError::Mismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn float_literal_in_int_field_is_reported() {
+        let src = "struct s { n int }\nfn main() { p := s{n: 1.5} }";
+        let d = struct_fields(src);
+        let f = lit_of(src);
+        assert!(matches!(
+            check_field_value_literals(&d, &f),
+            Some(ValueError::Mismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn int_literal_in_float_field_is_silent_go_converts_the_constant() {
+        let src = "struct s { f float64 }\nfn main() { p := s{f: 2} }";
+        let d = struct_fields(src);
+        let f = lit_of(src);
+        assert!(check_field_value_literals(&d, &f).is_none());
+    }
+
+    #[test]
+    fn matching_literals_are_silent() {
+        let src = "struct s { a int  b string  c bool }\nfn main() { p := s{a: 1, b: \"x\", c: true} }";
+        let d = struct_fields(src);
+        let f = lit_of(src);
+        assert!(check_field_value_literals(&d, &f).is_none());
+    }
+
+    #[test]
+    fn non_literal_values_are_never_reported() {
+        // The type of an identifier is not knowable here (#152 will close that
+        // separately); a false reject would be far worse than a missed one.
+        let src = "struct s { n int }\nfn main() { v := 1\n p := s{n: v} }";
+        let d = struct_fields(src);
+        let e = hy_syntax::parse_file("t.hy", src).expect("parse");
+        let fnmain = e.fns().next().unwrap();
+        let stmts = &fnmain.body.as_ref().unwrap().stmts;
+        let mut f = Vec::new();
+        for st in stmts {
+            if let Stmt::Local(l) = st {
+                if let Expr::StructLit { fields, .. } = &l.values[0] {
+                    f = fields.clone();
+                }
+            }
+        }
+        assert!(check_field_value_literals(&d, &f).is_none());
+    }
+
+    #[test]
+    fn user_defined_field_type_is_silent() {
+        let src = "struct s { t titik }\nfn main() { p := s{t: 7} }";
+        let d = struct_fields(src);
+        let f = lit_of(src);
+        assert!(check_field_value_literals(&d, &f).is_none());
     }
 }

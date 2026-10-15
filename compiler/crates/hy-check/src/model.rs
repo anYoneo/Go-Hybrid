@@ -445,6 +445,29 @@ impl<'a> Checker<'a> {
         let Some(declared) = self.structs.get(name) else {
             return;
         };
+        if let Some(crate::fields::ValueError::Mismatch {
+            field,
+            declared: dt,
+            given,
+        }) = crate::fields::check_field_value_literals(declared, fields)
+        {
+            self.diags.push(
+                Diagnostic::error(
+                    "HYB-E5005",
+                    self.path.clone(),
+                    *span,
+                    format!(
+                        "field `{}` of `{}` is declared `{}` but the literal is {} (HYB-E5005)",
+                        field, name, dt, given
+                    ),
+                )
+                .with_notes(vec![
+                    "the emitted Go cannot build: `cannot use ... as ... value in struct literal`"
+                        .to_string(),
+                ]),
+            );
+        }
+
         match crate::fields::check_struct_lit_fields(declared, fields) {
             Some(crate::fields::FieldError::Unknown { name: field }) => {
                 self.diags.push(
